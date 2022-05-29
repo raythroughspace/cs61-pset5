@@ -22,30 +22,13 @@ struct command {
     bool stdout_redir = false;
     bool stderr_redir = false;
     pid_t pid = -1;      // process ID running this command, -1 if none
+    pid_t pgid = -1; //process group ID running this command, -1 if none
     command* next = nullptr;
     command* prev = nullptr;
     int read_end; //read_end from pipe
     int op = TYPE_SEQUENCE;
-    command();
-    ~command();
-
-    pid_t run();
+    pid_t run(pid_t pgid);
 };
-
-
-// command::command()
-//    This constructor function initializes a `command` structure. You may
-//    add stuff to it as you grow the command structure.
-
-command::command() {
-}
-
-
-// command::~command()
-//    This destructor function is called to delete a command.
-
-command::~command() {
-}
 
 
 // COMMAND EXECUTION
@@ -66,7 +49,7 @@ command::~command() {
 //       setting the child process’s process group. To avoid race conditions,
 //       this will require TWO calls to `setpgid`.
 
-pid_t command::run() {
+pid_t command::run(pid_t pgid) {
     assert(this->args.size() > 0);
     char* cargs[this->args.size() + 1];
     for (size_t i = 0; i< this->args.size(); ++i){
@@ -80,6 +63,10 @@ pid_t command::run() {
     }
     int c = fork();
     if (c==0){
+        if (!this->prev || (this->prev && this->prev->op != TYPE_PIPE)){
+            setpgid(0,0);
+            this->pgid = getpid();
+        }
         if (this->op == TYPE_PIPE){
             dup2(pfd[1], 1);
             close(pfd[1]);
@@ -115,7 +102,7 @@ pid_t command::run() {
             dup2(fd, 2);
         }
         int r = execvp(cargs[0], cargs);
-        fprintf(stderr, "Process %d exited abnormally", c);
+        fprintf(stderr, "Process %d exited abnormally\n", c);
         _exit(EXIT_FAILURE);
     }
     if (this->op == TYPE_PIPE){
@@ -125,6 +112,10 @@ pid_t command::run() {
         close(this->read_end);
     }
     this->pid = c;
+    if (pgid != -1){
+        this->pgid = pgid;
+        setpgid(this->pid, this->pgid);
+    }
     return this->pid;
 }
 
@@ -154,11 +145,19 @@ pid_t command::run() {
 //         process group, `pgid`.
 //       - Call `claim_foreground(pgid)` before waiting for the pipeline.
 //       - Call `claim_foreground(0)` once the pipeline is complete.
+bool foreground_pipeline(command* c){
+
+}
 int run_pipeline(command* c){
     int status; //status of last command
     pid_t p; //pid_t of last command
+    pid_t pgid = -1;
     while (c){
-        p = c->run();
+        p = c->run(pgid);
+        //first command has pgid set to pid
+        if (c->pgid != -1){
+            pgid = c->pgid;
+        }
         //move to next command in pipe
         while (c && c->op != TYPE_PIPE
                 && c->op != TYPE_BACKGROUND && c->op != TYPE_SEQUENCE
@@ -172,7 +171,9 @@ int run_pipeline(command* c){
         }
         c = c->next;
     }
+    claim_foreground(pgid);
     int w = waitpid(p, &status, 0);
+    claim_foreground(0);
     return status;
 }
 
@@ -191,8 +192,9 @@ void run_conditional(command* c){
                 return;
             }
             c = c->next;
-        } while((WEXITSTATUS(status) != 0 && c->prev->op == TYPE_AND)
-                ||(WEXITSTATUS(status) == 0 && c->prev->op == TYPE_OR));
+        } while(!((WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS && c->prev->op == TYPE_AND)
+                   ||(!WIFEXITED(status) && c->prev->op == TYPE_OR)
+                   ||(WIFEXITED(status) && WEXITSTATUS(status) != EXIT_SUCCESS && c->prev->op == TYPE_OR)));
     }
 }
 bool cond_in_background(command* c) {
