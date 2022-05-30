@@ -8,8 +8,6 @@
 // For the love of God
 #undef exit
 #define exit __DO_NOT_CALL_EXIT__READ_PROBLEM_SET_DESCRIPTION__
-
-
 // struct command
 //    Data structure describing a command. Add your own stuff.
 
@@ -27,15 +25,19 @@ struct command {
     command* prev = nullptr;
     int read_end; //read_end from pipe
     int op = TYPE_SEQUENCE;
+    bool is_foreground = false; //true if command is part of a foreground conditional
     pid_t run(pid_t pgid);
 };
 
 
 // COMMAND EXECUTION
 
-// command::run()
+// command::run(pid_t pgid)
 //    Create a single child process running the command in `this`.
 //    Sets `this->pid` to the pid of the child process and returns `this->pid`.
+//    If the command is cd, then returns 0 on success.
+//    Sets 'this->pgid' to the pgid if pgid != -1, otherwise, sets to this->pid.
+//    Returns -1 on failure.
 //
 //    PART 1: Fork a child process and run the command using `execvp`.
 //       This will require creating an array of `char*` arguments using
@@ -59,14 +61,25 @@ pid_t command::run(pid_t pgid) {
     int pfd[2];
     if (this->op == TYPE_PIPE){
         int r = pipe(pfd);
+        if (r == -1){
+            fprintf(stderr, "Pipe syscall failed\n");
+            return -1;
+        }
         this->next->read_end = pfd[0];
     }
-    int c = fork();
-    if (c==0){
-        if (!this->prev || (this->prev && this->prev->op != TYPE_PIPE)){
-            setpgid(0,0);
-            this->pgid = getpid();
+    if (this->args[0] == "cd"){
+        int r = chdir(this->args[1].c_str());
+        if (r == 0){
+            return 0;
         }
+        return -1;
+    }
+    int c = fork();
+    if (c == -1){
+        fprintf(stderr, "Fork syscall failed\n");
+        return -1;
+    }
+    if (c==0){
         if (this->op == TYPE_PIPE){
             dup2(pfd[1], 1);
             close(pfd[1]);
@@ -101,7 +114,7 @@ pid_t command::run(pid_t pgid) {
             }
             dup2(fd, 2);
         }
-        int r = execvp(cargs[0], cargs);
+        execvp(cargs[0], cargs);
         fprintf(stderr, "Process %d exited abnormally\n", c);
         _exit(EXIT_FAILURE);
     }
@@ -112,10 +125,13 @@ pid_t command::run(pid_t pgid) {
         close(this->read_end);
     }
     this->pid = c;
-    if (pgid != -1){
-        this->pgid = pgid;
-        setpgid(this->pid, this->pgid);
+    if (!this->prev || (this->prev && this->prev->op != TYPE_PIPE)){
+        this->pgid = this->pid;
     }
+    else{
+        this->pgid = pgid;
+    }
+    setpgid(this->pid, this->pid);
     return this->pid;
 }
 
@@ -145,38 +161,55 @@ pid_t command::run(pid_t pgid) {
 //         process group, `pgid`.
 //       - Call `claim_foreground(pgid)` before waiting for the pipeline.
 //       - Call `claim_foreground(0)` once the pipeline is complete.
-bool foreground_pipeline(command* c){
 
+// set_foreground(c)
+//    Sets the is_foreground attribute of all commands in a conditional to true if
+//    the conditional is in the foreground, false if in the background.
+void set_foreground(command* c){
+    while (c->op != TYPE_SEQUENCE && c->op != TYPE_BACKGROUND) {
+        c->is_foreground = true;
+        c = c->next;
+    }
+    c->is_foreground = true;
 }
+// run_pipeline(c)
+//    Run all commands in a pipeline in parallel. Returns the exit
+//    status of the last command in the pipeline, -1 on failure.
 int run_pipeline(command* c){
     int status; //status of last command
     pid_t p; //pid_t of last command
     pid_t pgid = -1;
+    bool is_foreground = c->is_foreground;
     while (c){
         p = c->run(pgid);
-        //first command has pgid set to pid
-        if (c->pgid != -1){
-            pgid = c->pgid;
-        }
+        pgid = c->pgid;
         //move to next command in pipe
         while (c && c->op != TYPE_PIPE
                 && c->op != TYPE_BACKGROUND && c->op != TYPE_SEQUENCE
                 && c->op != TYPE_AND && c->op !=TYPE_OR){
             c= c->next;
         }
+        //no more commands in this pipeline
         if (!c || c->op == TYPE_BACKGROUND || c->op == TYPE_SEQUENCE
-            || c->op == TYPE_AND || c->op ==TYPE_OR){ //no more commands
-            int w = waitpid(p, &status, 0);
-            return status;
+            || c->op == TYPE_AND || c->op ==TYPE_OR){
+            break;
         }
         c = c->next;
     }
-    claim_foreground(pgid);
-    int w = waitpid(p, &status, 0);
+    if (is_foreground){
+        claim_foreground(pgid);
+    }
+    if (p != -1){
+        waitpid(p, &status, 0);
+    }else{
+        status = -1;
+    }
     claim_foreground(0);
     return status;
 }
 
+// run_conditional(c)
+//    Runs all pipelines in a conditional.
 void run_conditional(command* c){
     int status;
     while (c){
@@ -197,6 +230,8 @@ void run_conditional(command* c){
                    ||(WIFEXITED(status) && WEXITSTATUS(status) != EXIT_SUCCESS && c->prev->op == TYPE_OR)));
     }
 }
+// cond_in_background(c)
+//    Returns true if c is a command in a background conditional, false otherwise.
 bool cond_in_background(command* c) {
     while (c->op != TYPE_SEQUENCE && c->op != TYPE_BACKGROUND) {
         c = c->next;
@@ -204,6 +239,8 @@ bool cond_in_background(command* c) {
     return c->op == TYPE_BACKGROUND;
 }
 
+// run_list(c)
+//    Runs all conditional in a list.
 void run_list(command* c) {
     while (c){
         if (cond_in_background(c)){
@@ -214,6 +251,7 @@ void run_list(command* c) {
             }
         }
         else{
+            set_foreground(c);
             run_conditional(c);
         }
         //move to first command of next conditional
@@ -281,7 +319,6 @@ command* parse_line(const char* s) {
     return chead;
 }
 
-
 int main(int argc, char* argv[]) {
     FILE* command_file = stdin;
     bool quiet = false;
@@ -348,6 +385,5 @@ int main(int argc, char* argv[]) {
         // Your code here!
         while (waitpid(-1, nullptr, WNOHANG) > 0){}
     }
-
     return 0;
 }
